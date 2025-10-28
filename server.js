@@ -129,7 +129,7 @@ app.get('/api/audio-info/:videoId', async (req, res) => {
   }
 });
 
-// ИСПРАВЛЕНО: Простой универсальный селектор формата
+// ФИНАЛЬНОЕ ИСПРАВЛЕНИЕ: Fallback на best если bestaudio недоступен
 app.get('/api/download-audio/:videoId', async (req, res) => {
   let tempFile = null;
   
@@ -149,21 +149,19 @@ app.get('/api/download-audio/:videoId', async (req, res) => {
     const cookiesPath = path.join(__dirname, 'cookies.txt');
     const cookiesArg = fs.existsSync(cookiesPath) ? `--cookies ${cookiesPath}` : '';
 
-    // КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Используем простейший селектор + конвертация yt-dlp
-    // -f bestaudio: берет лучший аудио формат (любой)
-    // -x: извлекает аудио
-    // --audio-format m4a: конвертирует в m4a
-    // --audio-quality 128K: качество
-    const downloadCommand = `${YT_DLP_PATH} ${cookiesArg} -f bestaudio -x --audio-format m4a --audio-quality 128K -o "${tempPrefix}.%(ext)s" --no-playlist --no-warnings "${videoUrl}"`;
+    // ИСПРАВЛЕНИЕ: Используем "bestaudio/best" для fallback
+    // Если bestaudio недоступен - берет best (комбинированный формат)
+    // Затем извлекает аудио через -x
+    const downloadCommand = `${YT_DLP_PATH} ${cookiesArg} -f "bestaudio/best" -x --audio-format m4a --audio-quality 128K -o "${tempPrefix}.%(ext)s" --no-playlist --no-warnings "${videoUrl}"`;
     
-    console.log(`🎵 Executing download (universal format selector)...`);
+    console.log(`🎵 Executing download (with fallback)...`);
     
     await execPromise(downloadCommand, { 
       maxBuffer: 200 * 1024 * 1024,
       timeout: 600000 // 10 минут
     });
 
-    // Находим созданный файл (yt-dlp добавляет расширение)
+    // Находим созданный файл
     const files = fs.readdirSync(tempDir).filter(f => f.startsWith(path.basename(tempPrefix)));
     
     if (files.length === 0) {
@@ -210,7 +208,6 @@ app.get('/api/download-audio/:videoId', async (req, res) => {
 
   } catch (error) {
     console.error('❌ Download error:', error.message);
-    console.error('Full error:', error);
     
     try {
       if (tempFile && fs.existsSync(tempFile)) {
@@ -259,3 +256,4 @@ checkYtDlp().then((success) => {
   console.error('Failed to start server:', err);
   process.exit(1);
 });
+
