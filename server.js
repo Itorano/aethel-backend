@@ -1,6 +1,6 @@
 const express = require('express');
 const cors = require('cors');
-const { exec, spawn } = require('child_process');
+const { exec } = require('child_process');
 const { promisify } = require('util');
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegStatic = require('ffmpeg-static');
@@ -56,10 +56,9 @@ app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     service: 'AETHEL Audio Backend',
-    version: '2.5.0',
+    version: '2.6.0',
     downloader: 'yt-dlp (standalone)',
     authentication: hasCookies ? 'cookies enabled' : 'no cookies',
-    streaming: 'enabled',
     endpoints: [
       'GET /api/audio-info/:videoId',
       'GET /api/download-audio/:videoId'
@@ -131,10 +130,9 @@ app.get('/api/audio-info/:videoId', async (req, res) => {
   }
 });
 
-// НОВЫЙ ПОДХОД: Streaming вместо полной конвертации
+// ОПТИМИЗИРОВАННЫЙ: Скачивание напрямую в M4A без FFmpeg
 app.get('/api/download-audio/:videoId', async (req, res) => {
-  let ytdlpProcess = null;
-  let ffmpegProcess = null;
+  let tempFile = null;
   
   try {
     const { videoId } = req.params;
@@ -142,76 +140,105 @@ app.get('/api/download-audio/:videoId', async (req, res) => {
     
     console.log(`📥 Downloading audio for: ${videoId}`);
 
+    // Создаем временную директорию
+    const tempDir = path.join(__dirname, 'temp');
+    if (!fs.existsSync(tempDir)) {
+      fs.mkdirSync(tempDir, { recursive: true });
+    }
+    
+    tempFile = path.join(tempDir, `${videoId}_${Date.now()}.m4a`);
+    
     const cookiesPath = path.join(__dirname, 'cookies.txt');
     const cookiesArg = fs.existsSync(cookiesPath) ? `--cookies ${cookiesPath}` : '';
 
-    // Настройки заголовков
+    // КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Скачиваем сразу в M4A без конвертации через FFmpeg
+    // Используем -x --audio-format m4a для конвертации внутри yt-dlp (быстрее)
+    const downloadCommand = `${YT_DLP_PATH} ${cookiesArg} -f "bestaudio[ext=m4a]/bestaudio" -x --audio-format m4a --audio-quality 128K -o "${tempFile}" --no-playlist --no-warnings "${videoUrl}"`;
+    
+    console.log(`🎵 Executing download (direct M4A)...`);
+    
+    // Увеличиваем таймаут и буфер для длинных видео
+    await execPromise(downloadCommand, { 
+      maxBuffer: 200 * 1024 * 1024, // 200MB буфер
+      timeout: 600000 // 10 минут таймаут
+    });
+
+    // Проверяем файл
+    if (!fs.existsSync(tempFile)) {
+      throw new Error('Download failed - temp file not created');
+    }
+
+    const stats = fs.statSync(tempFile);
+    console.log(`✅ Downloaded: ${(stats.size / (1024 * 1024)).toFixed(2)} MB`);
+
+    if (stats.size === 0) {
+      fs.unlinkSync(tempFile);
+      throw new Error('Downloaded file is empty');
+    }
+
+    // Отправляем файл клиенту
     res.setHeader('Content-Type', 'audio/mp4');
     res.setHeader('Content-Disposition', `attachment; filename="${videoId}.m4a"`);
+    res.setHeader('Content-Length', stats.size);
 
-    // Запускаем yt-dlp в режиме stdout (сразу в поток)
-    const ytdlpArgs = [
-      cookiesArg ? '--cookies' : null,
-      cookiesArg ? cookiesPath : null,
-      '-f', 'bestaudio/best',
-      '-o', '-',  // Вывод в stdout
-      '--no-playlist',
-      '--no-warnings',
-      '--quiet',
-      videoUrl
-    ].filter(arg => arg !== null);
-
-    console.log(`🎵 Starting streaming download...`);
+    const fileStream = fs.createReadStream(tempFile);
     
-    ytdlpProcess = spawn(YT_DLP_PATH, ytdlpArgs);
+    fileStream.pipe(res);
 
-    // Пайпим yt-dlp напрямую в FFmpeg без сохранения на диск
-    ffmpegProcess = ffmpeg(ytdlpProcess.stdout)
-      .audioBitrate(128)
-      .audioCodec('aac')
-      .audioChannels(2)
-      .format('mp4')
-      .on('start', () => {
-        console.log(`🎵 FFmpeg streaming started`);
-      })
-      .on('error', (err) => {
-        console.error(`❌ FFmpeg error: ${err.message}`);
-        if (ytdlpProcess) ytdlpProcess.kill();
-        if (!res.headersSent) {
-          res.status(500).json({ 
-            error: 'Streaming failed', 
-            message: err.message 
-          });
+    fileStream.on('end', () => {
+      console.log(`✅ Transfer completed: ${videoId}`);
+      // Удаляем временный файл после отправки
+      try {
+        fs.unlinkSync(tempFile);
+        console.log(`🗑️ Temp file deleted`);
+      } catch (e) {
+        console.error('Error deleting temp file:', e.message);
+      }
+    });
+
+    fileStream.on('error', (err) => {
+      console.error(`❌ Stream error: ${err.message}`);
+      try {
+        if (fs.existsSync(tempFile)) {
+          fs.unlinkSync(tempFile);
         }
-      })
-      .on('end', () => {
-        console.log(`✅ Streaming completed: ${videoId}`);
-      });
-
-    // Стримим напрямую клиенту
-    ffmpegProcess.pipe(res, { end: true });
-
-    // Обработка отключения клиента
-    req.on('close', () => {
-      console.log('⚠️ Client disconnected, stopping processes');
-      if (ytdlpProcess) ytdlpProcess.kill();
-      if (ffmpegProcess) ffmpegProcess.kill();
+      } catch (e) {}
     });
 
   } catch (error) {
     console.error('❌ Download error:', error.message);
+    console.error('Full error:', error);
     
-    if (ytdlpProcess) ytdlpProcess.kill();
-    if (ffmpegProcess) ffmpegProcess.kill();
+    // Удаляем временные файлы при ошибке
+    try {
+      if (tempFile && fs.existsSync(tempFile)) {
+        fs.unlinkSync(tempFile);
+      }
+    } catch (e) {}
     
     if (!res.headersSent) {
       res.status(500).json({
         error: 'Failed to download audio',
-        message: error.message
+        message: error.message,
+        details: error.toString()
       });
     }
   }
 });
+
+// Очистка старых временных файлов при старте
+function cleanupTempFiles() {
+  const tempDir = path.join(__dirname, 'temp');
+  if (fs.existsSync(tempDir)) {
+    const files = fs.readdirSync(tempDir);
+    files.forEach(file => {
+      try {
+        fs.unlinkSync(path.join(tempDir, file));
+      } catch (e) {}
+    });
+    console.log(`🗑️ Cleaned up ${files.length} temp files`);
+  }
+}
 
 // Запуск сервера после проверки yt-dlp
 checkYtDlp().then((success) => {
@@ -220,10 +247,12 @@ checkYtDlp().then((success) => {
     process.exit(1);
   }
   
+  cleanupTempFiles();
+  
   app.listen(PORT, () => {
     console.log(`🚀 AETHEL Backend running on port ${PORT}`);
     console.log(`📍 http://localhost:${PORT}`);
-    console.log(`🎵 Ready to process audio downloads with streaming!`);
+    console.log(`🎵 Ready to process audio downloads!`);
   });
 }).catch(err => {
   console.error('Failed to start server:', err);
