@@ -4,8 +4,7 @@
   "description": "ASMR audio download backend",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "build": "npm install && wget -O yt-dlp https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp && chmod 755 yt-dlp"
+    "start": "node server.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
