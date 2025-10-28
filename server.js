@@ -1,10 +1,13 @@
 const express = require('express');
 const cors = require('cors');
-const ytdlp = require('yt-dlp-exec');
+const { exec } = require('child_process');
+const { promisify } = require('util');
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegStatic = require('ffmpeg-static');
 const fs = require('fs');
 const path = require('path');
+
+const execPromise = promisify(exec);
 
 ffmpeg.setFfmpegPath(ffmpegStatic);
 
@@ -14,13 +17,32 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
+// Проверка наличия yt-dlp при старте
+async function checkYtDlp() {
+  try {
+    const { stdout } = await execPromise('yt-dlp --version');
+    console.log(`✅ yt-dlp version: ${stdout.trim()}`);
+    return true;
+  } catch (error) {
+    console.error('❌ yt-dlp not found. Installing...');
+    try {
+      await execPromise('pip3 install yt-dlp || pip install yt-dlp');
+      console.log('✅ yt-dlp installed successfully!');
+      return true;
+    } catch (installError) {
+      console.error('❌ Failed to install yt-dlp:', installError.message);
+      return false;
+    }
+  }
+}
+
 // Главная страница
 app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     service: 'AETHEL Audio Backend',
-    version: '2.1.0',
-    downloader: 'yt-dlp',
+    version: '2.2.0',
+    downloader: 'yt-dlp (Python)',
     endpoints: [
       'GET /api/audio-info/:videoId',
       'GET /api/download-audio/:videoId'
@@ -37,14 +59,9 @@ app.get('/api/audio-info/:videoId', async (req, res) => {
     console.log(`📊 Getting info for: ${videoId}`);
 
     // Используем yt-dlp для получения метаданных
-    const metadata = await ytdlp(videoUrl, {
-      dumpSingleJson: true,
-      noWarnings: true,
-      noCallHome: true,
-      noCheckCertificate: true,
-      preferFreeFormats: true,
-      youtubeSkipDashManifest: true,
-    });
+    const command = `yt-dlp --dump-json --no-warnings "${videoUrl}"`;
+    const { stdout } = await execPromise(command);
+    const metadata = JSON.parse(stdout);
 
     if (!metadata) {
       return res.status(404).json({ error: 'Video not found' });
@@ -106,30 +123,33 @@ app.get('/api/download-audio/:videoId', async (req, res) => {
     console.log(`📥 Downloading audio for: ${videoId}`);
 
     // Создаем временный файл
-    tempFile = path.join(__dirname, `temp_${videoId}_${Date.now()}.webm`);
+    const tempDir = path.join(__dirname, 'temp');
+    if (!fs.existsSync(tempDir)) {
+      fs.mkdirSync(tempDir, { recursive: true });
+    }
+    
+    tempFile = path.join(tempDir, `${videoId}_${Date.now()}`);
     
     // Скачиваем аудио через yt-dlp
-    await ytdlp(videoUrl, {
-      output: tempFile,
-      format: 'bestaudio',
-      noPlaylist: true,
-      noWarnings: true,
-      quiet: true,
-    });
+    const downloadCommand = `yt-dlp -f bestaudio -o "${tempFile}.%(ext)s" --no-playlist --no-warnings "${videoUrl}"`;
+    await execPromise(downloadCommand);
 
-    console.log(`✅ Downloaded to temp file: ${tempFile}`);
-
-    // Проверяем, что файл создан
-    if (!fs.existsSync(tempFile)) {
+    // Находим скачанный файл (расширение может быть .webm, .m4a, .opus и т.д.)
+    const files = fs.readdirSync(tempDir).filter(f => f.startsWith(path.basename(tempFile)));
+    
+    if (files.length === 0) {
       throw new Error('Download failed - temp file not created');
     }
+    
+    const downloadedFile = path.join(tempDir, files[0]);
+    console.log(`✅ Downloaded to: ${downloadedFile}`);
 
     // Настройки заголовков
     res.setHeader('Content-Type', 'audio/mp4');
     res.setHeader('Content-Disposition', `attachment; filename="${videoId}.m4a"`);
 
     // Конвертируем в AAC через FFmpeg и стримим клиенту
-    const ffmpegStream = ffmpeg(tempFile)
+    const ffmpegStream = ffmpeg(downloadedFile)
       .audioBitrate(128)
       .audioCodec('aac')
       .audioChannels(2)
@@ -145,17 +165,24 @@ app.get('/api/download-audio/:videoId', async (req, res) => {
       .on('end', () => {
         console.log(`✅ Conversion completed: ${videoId}`);
         // Удаляем временный файл
-        if (tempFile && fs.existsSync(tempFile)) {
-          fs.unlinkSync(tempFile);
-          console.log(`🗑️ Temp file deleted`);
+        try {
+          if (downloadedFile && fs.existsSync(downloadedFile)) {
+            fs.unlinkSync(downloadedFile);
+            console.log(`🗑️ Temp file deleted`);
+          }
+        } catch (e) {
+          console.error('Error deleting temp file:', e.message);
         }
       })
       .on('error', (err) => {
         console.error(`❌ FFmpeg error: ${err.message}`);
         // Удаляем временный файл при ошибке
-        if (tempFile && fs.existsSync(tempFile)) {
-          fs.unlinkSync(tempFile);
-        }
+        try {
+          if (downloadedFile && fs.existsSync(downloadedFile)) {
+            fs.unlinkSync(downloadedFile);
+          }
+        } catch (e) {}
+        
         if (!res.headersSent) {
           res.status(500).json({ 
             error: 'Conversion failed', 
@@ -169,10 +196,18 @@ app.get('/api/download-audio/:videoId', async (req, res) => {
   } catch (error) {
     console.error('❌ Download error:', error.message);
     
-    // Удаляем временный файл при ошибке
-    if (tempFile && fs.existsSync(tempFile)) {
-      fs.unlinkSync(tempFile);
-    }
+    // Удаляем временные файлы при ошибке
+    try {
+      const tempDir = path.join(__dirname, 'temp');
+      if (fs.existsSync(tempDir)) {
+        const files = fs.readdirSync(tempDir);
+        files.forEach(file => {
+          if (file.includes(req.params.videoId)) {
+            fs.unlinkSync(path.join(tempDir, file));
+          }
+        });
+      }
+    } catch (e) {}
     
     if (!res.headersSent) {
       res.status(500).json({
@@ -183,8 +218,19 @@ app.get('/api/download-audio/:videoId', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`🚀 AETHEL Backend running on port ${PORT}`);
-  console.log(`📍 http://localhost:${PORT}`);
-  console.log(`🎵 Ready to process audio downloads!`);
+// Запуск сервера после проверки yt-dlp
+checkYtDlp().then((success) => {
+  if (!success) {
+    console.error('❌ Cannot start server without yt-dlp');
+    process.exit(1);
+  }
+  
+  app.listen(PORT, () => {
+    console.log(`🚀 AETHEL Backend running on port ${PORT}`);
+    console.log(`📍 http://localhost:${PORT}`);
+    console.log(`🎵 Ready to process audio downloads!`);
+  });
+}).catch(err => {
+  console.error('Failed to start server:', err);
+  process.exit(1);
 });
