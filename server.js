@@ -2,6 +2,12 @@ const express = require('express');
 const cors = require('cors');
 const ytdl = require('@distube/ytdl-core');
 const ffmpeg = require('fluent-ffmpeg');
+const ffmpegStatic = require('ffmpeg-static');
+
+// Укажите fluent-ffmpeg путь к статической сборке FFmpeg
+// ffmpeg-static возвращает строку напрямую, не объект с .path
+ffmpeg.setFfmpegPath(ffmpegStatic);
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
