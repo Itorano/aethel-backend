@@ -32,6 +32,15 @@ async function checkYtDlp() {
     
     const { stdout } = await execPromise(`${YT_DLP_PATH} --version`);
     console.log(`✅ yt-dlp version: ${stdout.trim()}`);
+    
+    // Проверяем наличие cookies
+    const cookiesPath = path.join(__dirname, 'cookies.txt');
+    if (fs.existsSync(cookiesPath)) {
+      console.log('✅ cookies.txt found - YouTube authentication enabled');
+    } else {
+      console.log('⚠️  cookies.txt not found - some videos may fail due to bot detection');
+    }
+    
     return true;
   } catch (error) {
     console.error('❌ Failed to setup yt-dlp:', error.message);
@@ -41,11 +50,15 @@ async function checkYtDlp() {
 
 // Главная страница
 app.get('/', (req, res) => {
+  const cookiesPath = path.join(__dirname, 'cookies.txt');
+  const hasCookies = fs.existsSync(cookiesPath);
+  
   res.json({
     status: 'ok',
     service: 'AETHEL Audio Backend',
-    version: '2.3.0',
+    version: '2.4.0',
     downloader: 'yt-dlp (standalone)',
+    authentication: hasCookies ? 'cookies enabled' : 'no cookies',
     endpoints: [
       'GET /api/audio-info/:videoId',
       'GET /api/download-audio/:videoId'
@@ -61,8 +74,11 @@ app.get('/api/audio-info/:videoId', async (req, res) => {
     
     console.log(`📊 Getting info for: ${videoId}`);
 
-    // Используем yt-dlp для получения метаданных
-    const command = `${YT_DLP_PATH} --dump-json --no-warnings --no-playlist "${videoUrl}"`;
+    // Используем yt-dlp с cookies для обхода bot detection
+    const cookiesPath = path.join(__dirname, 'cookies.txt');
+    const cookiesArg = fs.existsSync(cookiesPath) ? `--cookies ${cookiesPath}` : '';
+    
+    const command = `${YT_DLP_PATH} ${cookiesArg} --dump-json --no-warnings --no-playlist "${videoUrl}"`;
     const { stdout } = await execPromise(command, { maxBuffer: 10 * 1024 * 1024 });
     const metadata = JSON.parse(stdout);
 
@@ -139,8 +155,12 @@ app.get('/api/download-audio/:videoId', async (req, res) => {
     
     tempFile = path.join(tempDir, `${videoId}_${Date.now()}`);
     
-    // Скачиваем аудио через yt-dlp
-    const downloadCommand = `${YT_DLP_PATH} -f bestaudio -o "${tempFile}.%(ext)s" --no-playlist --no-warnings --quiet "${videoUrl}"`;
+    // Используем cookies если они есть
+    const cookiesPath = path.join(__dirname, 'cookies.txt');
+    const cookiesArg = fs.existsSync(cookiesPath) ? `--cookies ${cookiesPath}` : '';
+    
+    // Скачиваем аудио через yt-dlp с cookies
+    const downloadCommand = `${YT_DLP_PATH} ${cookiesArg} -f bestaudio -o "${tempFile}.%(ext)s" --no-playlist --no-warnings --quiet "${videoUrl}"`;
     await execPromise(downloadCommand, { maxBuffer: 100 * 1024 * 1024 });
 
     // Находим скачанный файл
