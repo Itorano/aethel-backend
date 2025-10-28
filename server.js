@@ -159,9 +159,16 @@ app.get('/api/download-audio/:videoId', async (req, res) => {
     const cookiesPath = path.join(__dirname, 'cookies.txt');
     const cookiesArg = fs.existsSync(cookiesPath) ? `--cookies ${cookiesPath}` : '';
     
-    // Скачиваем аудио через yt-dlp с cookies
-    const downloadCommand = `${YT_DLP_PATH} ${cookiesArg} -f bestaudio -o "${tempFile}.%(ext)s" --no-playlist --no-warnings --quiet "${videoUrl}"`;
-    await execPromise(downloadCommand, { maxBuffer: 100 * 1024 * 1024 });
+    // ИСПРАВЛЕНИЕ: более гибкий выбор формата
+    // Сначала пробуем bestaudio, если не работает - берем любой аудио
+    const downloadCommand = `${YT_DLP_PATH} ${cookiesArg} -f "bestaudio/best" -x --audio-format best -o "${tempFile}.%(ext)s" --no-playlist --no-warnings "${videoUrl}"`;
+    
+    console.log(`🎵 Executing: ${downloadCommand.replace(cookiesPath, '[COOKIES]')}`);
+    
+    await execPromise(downloadCommand, { 
+      maxBuffer: 100 * 1024 * 1024,
+      timeout: 300000 // 5 минут таймаут
+    });
 
     // Находим скачанный файл
     const files = fs.readdirSync(tempDir).filter(f => f.startsWith(path.basename(tempFile)));
@@ -224,6 +231,7 @@ app.get('/api/download-audio/:videoId', async (req, res) => {
 
   } catch (error) {
     console.error('❌ Download error:', error.message);
+    console.error('Full error:', error);
     
     // Удаляем временные файлы при ошибке
     try {
@@ -241,7 +249,8 @@ app.get('/api/download-audio/:videoId', async (req, res) => {
     if (!res.headersSent) {
       res.status(500).json({
         error: 'Failed to download audio',
-        message: error.message
+        message: error.message,
+        details: error.toString()
       });
     }
   }
@@ -263,3 +272,4 @@ checkYtDlp().then((success) => {
   console.error('Failed to start server:', err);
   process.exit(1);
 });
+
