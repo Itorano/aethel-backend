@@ -33,7 +33,6 @@ async function checkYtDlp() {
     const { stdout } = await execPromise(`${YT_DLP_PATH} --version`);
     console.log(`✅ yt-dlp version: ${stdout.trim()}`);
     
-    // Проверяем наличие cookies
     const cookiesPath = path.join(__dirname, 'cookies.txt');
     if (fs.existsSync(cookiesPath)) {
       console.log('✅ cookies.txt found - YouTube authentication enabled');
@@ -56,7 +55,7 @@ app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     service: 'AETHEL Audio Backend',
-    version: '2.6.0',
+    version: '2.7.0',
     downloader: 'yt-dlp (standalone)',
     authentication: hasCookies ? 'cookies enabled' : 'no cookies',
     endpoints: [
@@ -130,7 +129,7 @@ app.get('/api/audio-info/:videoId', async (req, res) => {
   }
 });
 
-// ОПТИМИЗИРОВАННЫЙ: Скачивание напрямую в M4A без FFmpeg
+// ИСПРАВЛЕНО: Простой универсальный селектор формата
 app.get('/api/download-audio/:videoId', async (req, res) => {
   let tempFile = null;
   
@@ -140,34 +139,39 @@ app.get('/api/download-audio/:videoId', async (req, res) => {
     
     console.log(`📥 Downloading audio for: ${videoId}`);
 
-    // Создаем временную директорию
     const tempDir = path.join(__dirname, 'temp');
     if (!fs.existsSync(tempDir)) {
       fs.mkdirSync(tempDir, { recursive: true });
     }
     
-    tempFile = path.join(tempDir, `${videoId}_${Date.now()}.m4a`);
+    const tempPrefix = path.join(tempDir, `${videoId}_${Date.now()}`);
     
     const cookiesPath = path.join(__dirname, 'cookies.txt');
     const cookiesArg = fs.existsSync(cookiesPath) ? `--cookies ${cookiesPath}` : '';
 
-    // КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Скачиваем сразу в M4A без конвертации через FFmpeg
-    // Используем -x --audio-format m4a для конвертации внутри yt-dlp (быстрее)
-    const downloadCommand = `${YT_DLP_PATH} ${cookiesArg} -f "bestaudio[ext=m4a]/bestaudio" -x --audio-format m4a --audio-quality 128K -o "${tempFile}" --no-playlist --no-warnings "${videoUrl}"`;
+    // КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Используем простейший селектор + конвертация yt-dlp
+    // -f bestaudio: берет лучший аудио формат (любой)
+    // -x: извлекает аудио
+    // --audio-format m4a: конвертирует в m4a
+    // --audio-quality 128K: качество
+    const downloadCommand = `${YT_DLP_PATH} ${cookiesArg} -f bestaudio -x --audio-format m4a --audio-quality 128K -o "${tempPrefix}.%(ext)s" --no-playlist --no-warnings "${videoUrl}"`;
     
-    console.log(`🎵 Executing download (direct M4A)...`);
+    console.log(`🎵 Executing download (universal format selector)...`);
     
-    // Увеличиваем таймаут и буфер для длинных видео
     await execPromise(downloadCommand, { 
-      maxBuffer: 200 * 1024 * 1024, // 200MB буфер
-      timeout: 600000 // 10 минут таймаут
+      maxBuffer: 200 * 1024 * 1024,
+      timeout: 600000 // 10 минут
     });
 
-    // Проверяем файл
-    if (!fs.existsSync(tempFile)) {
-      throw new Error('Download failed - temp file not created');
+    // Находим созданный файл (yt-dlp добавляет расширение)
+    const files = fs.readdirSync(tempDir).filter(f => f.startsWith(path.basename(tempPrefix)));
+    
+    if (files.length === 0) {
+      throw new Error('Download failed - no output file created');
     }
 
+    tempFile = path.join(tempDir, files[0]);
+    
     const stats = fs.statSync(tempFile);
     console.log(`✅ Downloaded: ${(stats.size / (1024 * 1024)).toFixed(2)} MB`);
 
@@ -187,7 +191,6 @@ app.get('/api/download-audio/:videoId', async (req, res) => {
 
     fileStream.on('end', () => {
       console.log(`✅ Transfer completed: ${videoId}`);
-      // Удаляем временный файл после отправки
       try {
         fs.unlinkSync(tempFile);
         console.log(`🗑️ Temp file deleted`);
@@ -209,7 +212,6 @@ app.get('/api/download-audio/:videoId', async (req, res) => {
     console.error('❌ Download error:', error.message);
     console.error('Full error:', error);
     
-    // Удаляем временные файлы при ошибке
     try {
       if (tempFile && fs.existsSync(tempFile)) {
         fs.unlinkSync(tempFile);
@@ -240,7 +242,6 @@ function cleanupTempFiles() {
   }
 }
 
-// Запуск сервера после проверки yt-dlp
 checkYtDlp().then((success) => {
   if (!success) {
     console.error('❌ Cannot start server without yt-dlp');
