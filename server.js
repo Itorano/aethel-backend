@@ -1,6 +1,11 @@
 const express = require('express');
-const cors = require('cors');
 const ytdl = require('@distube/ytdl-core');
+const ffmpeg = require('fluent-ffmpeg');
+const ffmpegPath = require('ffmpeg-static');
+const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
+const { v4: uuidv4 } = require('uuid');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -8,142 +13,98 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// Кэш для хранения результатов
-const cache = new Map();
-const CACHE_TTL = 3600000; // 1 час
+const TMP_DIR = path.join(__dirname, 'uploads');
+if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR);
 
-// Список User-Agents для ротации
-const userAgents = [
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
-];
-
-function getRandomUserAgent() {
-  return userAgents[Math.floor(Math.random() * userAgents.length)];
-}
-
-// Очистка старого кэша каждые 10 минут
+// Utility: удаляет временные файлы старше 10 минут каждые 5 мин
 setInterval(() => {
   const now = Date.now();
-  for (const [key, value] of cache.entries()) {
-    if (now - value.timestamp > CACHE_TTL) {
-      cache.delete(key);
-    }
-  }
-  console.log(`Cache cleanup: ${cache.size} items remaining`);
-}, 600000);
-
-app.get('/', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    service: 'AETHEL Audio Backend',
-    version: '1.1.0',
-    message: 'Server is running successfully!',
-    cache_size: cache.size
-  });
-});
-
-app.get('/api/audio-info/:videoId', async (req, res) => {
-  try {
-    const { videoId } = req.params;
-    
-    console.log(`[${new Date().toISOString()}] Getting info for: ${videoId}`);
-    
-    // Проверяем кэш
-    const cached = cache.get(videoId);
-    if (cached && (Date.now() - cached.timestamp < CACHE_TTL)) {
-      console.log(`[${new Date().toISOString()}] Cache HIT for: ${videoId}`);
-      return res.json(cached.data);
-    }
-    
-    console.log(`[${new Date().toISOString()}] Cache MISS for: ${videoId}`);
-    
-    // Опции для обхода 429
-    const options = {
-      requestOptions: {
-        headers: {
-          'User-Agent': getRandomUserAgent(),
-          'Accept-Language': 'en-US,en;q=0.9',
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          'Accept-Encoding': 'gzip, deflate',
-          'Connection': 'keep-alive',
+  fs.readdir(TMP_DIR, (err, files) => {
+    if (err) return;
+    for (const file of files) {
+      const filePath = path.join(TMP_DIR, file);
+      fs.stat(filePath, (err, stats) => {
+        if (!err && now - stats.mtimeMs > 10 * 60 * 1000) {
+          fs.unlink(filePath, () => {});
         }
-      }
-    };
-    
-    const info = await ytdl.getInfo(videoId, options);
-    const audioFormats = ytdl.filterFormats(info.formats, 'audioonly');
-    
-    if (audioFormats.length === 0) {
-      console.log(`[${new Date().toISOString()}] No audio formats found for: ${videoId}`);
-      return res.status(404).json({ error: 'No audio formats found' });
-    }
-    
-    const bestAudio = audioFormats.reduce((best, format) => {
-      const bestBitrate = best.audioBitrate || 0;
-      const currentBitrate = format.audioBitrate || 0;
-      return currentBitrate > bestBitrate ? format : best;
-    });
-    
-    console.log(`[${new Date().toISOString()}] Success! Bitrate: ${bestAudio.audioBitrate}, Size: ${bestAudio.contentLength}`);
-    
-    const responseData = {
-      videoId: videoId,
-      title: info.videoDetails.title,
-      duration: parseInt(info.videoDetails.lengthSeconds),
-      url: bestAudio.url,
-      size: parseInt(bestAudio.contentLength) || 0,
-      bitrate: bestAudio.audioBitrate || 128,
-      format: bestAudio.container || 'audio',
-      quality: bestAudio.audioQuality || 'medium'
-    };
-    
-    // Сохраняем в кэш
-    cache.set(videoId, {
-      data: responseData,
-      timestamp: Date.now()
-    });
-    
-    res.json(responseData);
-    
-  } catch (error) {
-    console.error(`[${new Date().toISOString()}] Error:`, error.message);
-    
-    // Если 429, возвращаем специальный код
-    if (error.message.includes('429') || error.statusCode === 429) {
-      return res.status(429).json({ 
-        error: 'Rate limited',
-        message: 'Too many requests. Please try again in a few minutes.',
-        retry_after: 300 // 5 минут
       });
     }
-    
-    res.status(500).json({ 
-      error: 'Failed to get audio info',
-      message: error.message 
+  });
+}, 5 * 60 * 1000);
+
+app.get('/', (req, res) => {
+  res.json({ status: 'ok', service: 'Audio Extractor', version: '2.0.0' });
+});
+
+// Получить метаданные (размер видео, длительность, ожидаемый размер аудио)
+app.get('/api/info/:videoId', async (req, res) => {
+  try {
+    const { videoId } = req.params;
+    const info = await ytdl.getInfo(videoId);
+
+    const format = ytdl.chooseFormat(info.formats, { quality: 'highest' });
+    const videoSize = format.contentLength ? parseInt(format.contentLength) : 0;
+    const durationSec = parseInt(info.videoDetails.lengthSeconds || '0');
+    const expectedAudioSize = Math.round((128 * 1000 / 8) * durationSec); // mp3 128kbps
+
+    res.json({
+      title: info.videoDetails.title,
+      videoSize,
+      durationSec,
+      expectedAudioSize,
+      thumbnail: info.videoDetails.thumbnails[0]?.url,
     });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'healthy', 
-    timestamp: new Date().toISOString(),
-    cache_size: cache.size
-  });
+// Скачать и конвертировать в аудио, возвращает ссылку
+app.post('/api/extract', async (req, res) => {
+  try {
+    const { videoId } = req.body;
+    if (!videoId) return res.status(400).json({ error: 'Missing videoId' });
+
+    const outId = uuidv4();
+    const videoPath = path.join(TMP_DIR, `${outId}.mp4`);
+    const audioPath = path.join(TMP_DIR, `${outId}.mp3`);
+
+    // Скачиваем видео
+    const videoStream = ytdl(videoId, { quality: 'highestvideo' });
+    const writeStream = fs.createWriteStream(videoPath);
+    videoStream.pipe(writeStream);
+
+    writeStream.on('finish', () => {
+      // Конвертация в mp3 через ffmpeg
+      ffmpeg(videoPath)
+        .setFfmpegPath(ffmpegPath)
+        .output(audioPath)
+        .audioCodec('libmp3lame')
+        .audioBitrate(128)
+        .on('end', () => {
+          // После конвертации удаляем видео
+          fs.unlink(videoPath, () => {});
+          // Отдаем ссылку на аудио
+          res.json({ audioUrl: `/audio/${outId}.mp3` });
+        })
+        .on('error', (err) => {
+          fs.unlink(videoPath, () => {});
+          res.status(500).json({ error: 'FFmpeg error: ' + err.message });
+        })
+        .run();
+    });
+
+    writeStream.on('error', (err) => {
+      res.status(500).json({ error: err.message });
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-// Очистка кэша (для отладки)
-app.post('/api/clear-cache', (req, res) => {
-  cache.clear();
-  res.json({ message: 'Cache cleared', size: 0 });
-});
+// Отдача готовых аудиофайлов
+app.use('/audio', express.static(TMP_DIR));
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 AETHEL Backend running on port ${PORT}`);
-  console.log(`📍 Server started at ${new Date().toISOString()}`);
-  console.log(`💾 Cache enabled with TTL: ${CACHE_TTL}ms`);
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });
