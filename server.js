@@ -17,22 +17,25 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
+// Путь к yt-dlp binary
+const YT_DLP_PATH = path.join(__dirname, 'yt-dlp');
+
 // Проверка наличия yt-dlp при старте
 async function checkYtDlp() {
   try {
-    const { stdout } = await execPromise('yt-dlp --version');
+    if (!fs.existsSync(YT_DLP_PATH)) {
+      console.log('📥 Downloading yt-dlp binary...');
+      await execPromise(`wget -O ${YT_DLP_PATH} https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp`);
+      await execPromise(`chmod 755 ${YT_DLP_PATH}`);
+      console.log('✅ yt-dlp downloaded and made executable!');
+    }
+    
+    const { stdout } = await execPromise(`${YT_DLP_PATH} --version`);
     console.log(`✅ yt-dlp version: ${stdout.trim()}`);
     return true;
   } catch (error) {
-    console.error('❌ yt-dlp not found. Installing...');
-    try {
-      await execPromise('pip3 install yt-dlp || pip install yt-dlp');
-      console.log('✅ yt-dlp installed successfully!');
-      return true;
-    } catch (installError) {
-      console.error('❌ Failed to install yt-dlp:', installError.message);
-      return false;
-    }
+    console.error('❌ Failed to setup yt-dlp:', error.message);
+    return false;
   }
 }
 
@@ -41,8 +44,8 @@ app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     service: 'AETHEL Audio Backend',
-    version: '2.2.0',
-    downloader: 'yt-dlp (Python)',
+    version: '2.3.0',
+    downloader: 'yt-dlp (standalone)',
     endpoints: [
       'GET /api/audio-info/:videoId',
       'GET /api/download-audio/:videoId'
@@ -59,8 +62,8 @@ app.get('/api/audio-info/:videoId', async (req, res) => {
     console.log(`📊 Getting info for: ${videoId}`);
 
     // Используем yt-dlp для получения метаданных
-    const command = `yt-dlp --dump-json --no-warnings "${videoUrl}"`;
-    const { stdout } = await execPromise(command);
+    const command = `${YT_DLP_PATH} --dump-json --no-warnings --no-playlist "${videoUrl}"`;
+    const { stdout } = await execPromise(command, { maxBuffer: 10 * 1024 * 1024 });
     const metadata = JSON.parse(stdout);
 
     if (!metadata) {
@@ -80,10 +83,16 @@ app.get('/api/audio-info/:videoId', async (req, res) => {
 
     // Находим видео формат для сравнения
     const videoFormats = metadata.formats.filter(f => 
-      f.vcodec !== 'none' && f.acodec !== 'none'
+      f.vcodec !== 'none'
     );
     
-    const bestVideo = videoFormats.length > 0 ? videoFormats[0] : null;
+    const bestVideo = videoFormats.length > 0 
+      ? videoFormats.reduce((best, format) => {
+          const bestSize = best.filesize || best.filesize_approx || 0;
+          const currentSize = format.filesize || format.filesize_approx || 0;
+          return currentSize > bestSize ? format : best;
+        }, videoFormats[0])
+      : null;
 
     const audioSize = bestAudio.filesize || bestAudio.filesize_approx || 0;
     const videoSize = bestVideo?.filesize || bestVideo?.filesize_approx || audioSize * 3;
@@ -122,7 +131,7 @@ app.get('/api/download-audio/:videoId', async (req, res) => {
     
     console.log(`📥 Downloading audio for: ${videoId}`);
 
-    // Создаем временный файл
+    // Создаем временную директорию
     const tempDir = path.join(__dirname, 'temp');
     if (!fs.existsSync(tempDir)) {
       fs.mkdirSync(tempDir, { recursive: true });
@@ -131,10 +140,10 @@ app.get('/api/download-audio/:videoId', async (req, res) => {
     tempFile = path.join(tempDir, `${videoId}_${Date.now()}`);
     
     // Скачиваем аудио через yt-dlp
-    const downloadCommand = `yt-dlp -f bestaudio -o "${tempFile}.%(ext)s" --no-playlist --no-warnings "${videoUrl}"`;
-    await execPromise(downloadCommand);
+    const downloadCommand = `${YT_DLP_PATH} -f bestaudio -o "${tempFile}.%(ext)s" --no-playlist --no-warnings --quiet "${videoUrl}"`;
+    await execPromise(downloadCommand, { maxBuffer: 100 * 1024 * 1024 });
 
-    // Находим скачанный файл (расширение может быть .webm, .m4a, .opus и т.д.)
+    // Находим скачанный файл
     const files = fs.readdirSync(tempDir).filter(f => f.startsWith(path.basename(tempFile)));
     
     if (files.length === 0) {
@@ -142,7 +151,7 @@ app.get('/api/download-audio/:videoId', async (req, res) => {
     }
     
     const downloadedFile = path.join(tempDir, files[0]);
-    console.log(`✅ Downloaded to: ${downloadedFile}`);
+    console.log(`✅ Downloaded: ${files[0]}`);
 
     // Настройки заголовков
     res.setHeader('Content-Type', 'audio/mp4');
@@ -154,8 +163,8 @@ app.get('/api/download-audio/:videoId', async (req, res) => {
       .audioCodec('aac')
       .audioChannels(2)
       .format('mp4')
-      .on('start', (commandLine) => {
-        console.log(`🎵 FFmpeg started`);
+      .on('start', () => {
+        console.log(`🎵 FFmpeg conversion started`);
       })
       .on('progress', (progress) => {
         if (progress.percent) {
