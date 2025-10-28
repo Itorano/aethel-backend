@@ -1,6 +1,6 @@
 const express = require('express');
 const cors = require('cors');
-const YTDlpWrap = require('yt-dlp-wrap').default;
+const ytdlp = require('yt-dlp-exec');
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegStatic = require('ffmpeg-static');
 const fs = require('fs');
@@ -11,37 +11,6 @@ ffmpeg.setFfmpegPath(ffmpegStatic);
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ============================================
-// 🎵 YT-DLP ИНИЦИАЛИЗАЦИЯ
-// ============================================
-let ytDlpWrap;
-
-async function initYtDlp() {
-  try {
-    const ytDlpPath = './yt-dlp';
-    
-    // Проверяем, есть ли уже yt-dlp
-    if (!fs.existsSync(ytDlpPath)) {
-      console.log('📥 Downloading yt-dlp binary...');
-      await YTDlpWrap.downloadFromGithub(ytDlpPath);
-      console.log('✅ yt-dlp downloaded successfully!');
-      
-      // Делаем исполняемым на Linux/Mac
-      if (process.platform !== 'win32') {
-        fs.chmodSync(ytDlpPath, 0o755);
-      }
-    } else {
-      console.log('✅ yt-dlp binary found!');
-    }
-    
-    ytDlpWrap = new YTDlpWrap(ytDlpPath);
-    console.log('🎵 yt-dlp ready!');
-  } catch (error) {
-    console.error('❌ Failed to initialize yt-dlp:', error.message);
-    process.exit(1);
-  }
-}
-
 app.use(cors());
 app.use(express.json());
 
@@ -50,7 +19,7 @@ app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     service: 'AETHEL Audio Backend',
-    version: '2.0.0',
+    version: '2.1.0',
     downloader: 'yt-dlp',
     endpoints: [
       'GET /api/audio-info/:videoId',
@@ -68,8 +37,15 @@ app.get('/api/audio-info/:videoId', async (req, res) => {
     console.log(`📊 Getting info for: ${videoId}`);
 
     // Используем yt-dlp для получения метаданных
-    const metadata = await ytDlpWrap.getVideoInfo(videoUrl);
-    
+    const metadata = await ytdlp(videoUrl, {
+      dumpSingleJson: true,
+      noWarnings: true,
+      noCallHome: true,
+      noCheckCertificate: true,
+      preferFreeFormats: true,
+      youtubeSkipDashManifest: true,
+    });
+
     if (!metadata) {
       return res.status(404).json({ error: 'Video not found' });
     }
@@ -80,8 +56,8 @@ app.get('/api/audio-info/:videoId', async (req, res) => {
     );
     
     const bestAudio = audioFormats.reduce((best, format) => {
-      const bestSize = best.filesize || 0;
-      const currentSize = format.filesize || 0;
+      const bestSize = best.filesize || best.filesize_approx || 0;
+      const currentSize = format.filesize || format.filesize_approx || 0;
       return currentSize > bestSize ? format : best;
     }, audioFormats[0] || {});
 
@@ -92,10 +68,10 @@ app.get('/api/audio-info/:videoId', async (req, res) => {
     
     const bestVideo = videoFormats.length > 0 ? videoFormats[0] : null;
 
-    const audioSize = bestAudio.filesize || 0;
-    const videoSize = bestVideo?.filesize || audioSize * 3;
+    const audioSize = bestAudio.filesize || bestAudio.filesize_approx || 0;
+    const videoSize = bestVideo?.filesize || bestVideo?.filesize_approx || audioSize * 3;
     
-    // Оценка размера после конвертации в AAC
+    // Оценка размера после конвертации в AAC (~75% от оригинала)
     const estimatedAudioSize = Math.floor(audioSize * 0.75);
 
     res.json({
@@ -133,14 +109,13 @@ app.get('/api/download-audio/:videoId', async (req, res) => {
     tempFile = path.join(__dirname, `temp_${videoId}_${Date.now()}.webm`);
     
     // Скачиваем аудио через yt-dlp
-    await ytDlpWrap.execPromise([
-      videoUrl,
-      '-f', 'bestaudio',
-      '-o', tempFile,
-      '--no-playlist',
-      '--no-warnings',
-      '--quiet'
-    ]);
+    await ytdlp(videoUrl, {
+      output: tempFile,
+      format: 'bestaudio',
+      noPlaylist: true,
+      noWarnings: true,
+      quiet: true,
+    });
 
     console.log(`✅ Downloaded to temp file: ${tempFile}`);
 
@@ -160,7 +135,7 @@ app.get('/api/download-audio/:videoId', async (req, res) => {
       .audioChannels(2)
       .format('mp4')
       .on('start', (commandLine) => {
-        console.log(`🎵 FFmpeg started: ${commandLine}`);
+        console.log(`🎵 FFmpeg started`);
       })
       .on('progress', (progress) => {
         if (progress.percent) {
@@ -172,7 +147,7 @@ app.get('/api/download-audio/:videoId', async (req, res) => {
         // Удаляем временный файл
         if (tempFile && fs.existsSync(tempFile)) {
           fs.unlinkSync(tempFile);
-          console.log(`🗑️ Temp file deleted: ${tempFile}`);
+          console.log(`🗑️ Temp file deleted`);
         }
       })
       .on('error', (err) => {
@@ -208,14 +183,8 @@ app.get('/api/download-audio/:videoId', async (req, res) => {
   }
 });
 
-// Запуск сервера после инициализации yt-dlp
-initYtDlp().then(() => {
-  app.listen(PORT, () => {
-    console.log(`🚀 AETHEL Backend running on port ${PORT}`);
-    console.log(`📍 http://localhost:${PORT}`);
-    console.log(`🎵 Ready to process audio downloads!`);
-  });
-}).catch(err => {
-  console.error('Failed to start server:', err);
-  process.exit(1);
+app.listen(PORT, () => {
+  console.log(`🚀 AETHEL Backend running on port ${PORT}`);
+  console.log(`📍 http://localhost:${PORT}`);
+  console.log(`🎵 Ready to process audio downloads!`);
 });
