@@ -1,15 +1,12 @@
 const express = require('express');
 const cors = require('cors');
-const { exec } = require('child_process');
+const { exec, execFile } = require('child_process');
 const { promisify } = require('util');
-const ffmpeg = require('fluent-ffmpeg');
-const ffmpegStatic = require('ffmpeg-static');
 const fs = require('fs');
 const path = require('path');
 
 const execPromise = promisify(exec);
-
-ffmpeg.setFfmpegPath(ffmpegStatic);
+const execFilePromise = promisify(execFile);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -17,61 +14,17 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// Путь к yt-dlp binary
 const YT_DLP_PATH = path.join(__dirname, 'yt-dlp');
 
-// ДОБАВЛЕНО: Браузерные заголовки для обхода bot detection
-const BROWSER_HEADERS = [
-  '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-  '--add-header', 'Accept-Language: ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
-  '--add-header', 'Accept: */*',
-  '--add-header', 'Accept-Encoding: gzip, deflate',
-];
-
-// Проверка наличия yt-dlp при старте
-async function checkYtDlp() {
+// ИСПРАВЛЕНИЕ: Используем массив вместо строки для избежания проблем с экранированием
+async function executeYtDlp(args) {
   try {
-    if (!fs.existsSync(YT_DLP_PATH)) {
-      console.log('📥 Downloading yt-dlp binary...');
-      await execPromise(`wget -O ${YT_DLP_PATH} https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp`);
-      await execPromise(`chmod 755 ${YT_DLP_PATH}`);
-      console.log('✅ yt-dlp downloaded and made executable!');
-    }
-    
-    const { stdout } = await execPromise(`${YT_DLP_PATH} --version`);
-    console.log(`✅ yt-dlp version: ${stdout.trim()}`);
-    
-    const cookiesPath = path.join(__dirname, 'cookies.txt');
-    if (fs.existsSync(cookiesPath)) {
-      console.log('✅ cookies.txt found - YouTube authentication enabled');
-    } else {
-      console.log('⚠️  cookies.txt not found - trying with browser headers instead');
-    }
-    
-    return true;
+    const { stdout, stderr } = await execFilePromise(YT_DLP_PATH, args);
+    return { stdout, stderr, success: true };
   } catch (error) {
-    console.error('❌ Failed to setup yt-dlp:', error.message);
-    return false;
+    return { stdout: '', stderr: error.message, success: false, error };
   }
 }
-
-// Главная страница
-app.get('/', (req, res) => {
-  const cookiesPath = path.join(__dirname, 'cookies.txt');
-  const hasCookies = fs.existsSync(cookiesPath);
-  
-  res.json({
-    status: 'ok',
-    service: 'AETHEL Audio Backend',
-    version: '2.8.0',
-    downloader: 'yt-dlp (standalone)',
-    authentication: hasCookies ? 'cookies enabled' : 'browser headers enabled',
-    endpoints: [
-      'GET /api/audio-info/:videoId',
-      'GET /api/download-audio/:videoId'
-    ]
-  });
-});
 
 // Получение информации о видео
 app.get('/api/audio-info/:videoId', async (req, res) => {
@@ -82,13 +35,37 @@ app.get('/api/audio-info/:videoId', async (req, res) => {
     console.log(`📊 Getting info for: ${videoId}`);
 
     const cookiesPath = path.join(__dirname, 'cookies.txt');
-    const cookiesArg = fs.existsSync(cookiesPath) ? `--cookies ${cookiesPath}` : '';
+    const args = [
+      fs.existsSync(cookiesPath) ? '--cookies' : '--no-cookies',
+    ];
     
-    // ИСПРАВЛЕНИЕ: Добавлены браузерные заголовки
-    const command = `${YT_DLP_PATH} ${cookiesArg} ${BROWSER_HEADERS.join(' ')} --dump-json --no-warnings --no-playlist --socket-timeout 30 "${videoUrl}"`;
-    
-    console.log(`🔄 Executing command with browser headers...`);
-    const { stdout } = await execPromise(command, { maxBuffer: 10 * 1024 * 1024 });
+    if (fs.existsSync(cookiesPath)) {
+      args.push(cookiesPath);
+    }
+
+    // ИСПРАВЛЕНИЕ: Браузерные заголовки как отдельные элементы массива
+    args.push(
+      '--user-agent',
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      '--add-header',
+      'Accept-Language: ru-RU,ru;q=0.9,en-US;q=0.8',
+      '--add-header',
+      'Accept: */*',
+      '--dump-json',
+      '--no-warnings',
+      '--no-playlist',
+      '--socket-timeout',
+      '30',
+      videoUrl
+    );
+
+    console.log(`🔄 Executing yt-dlp with proper escaping...`);
+    const { stdout, success, stderr } = await executeYtDlp(args);
+
+    if (!success) {
+      throw new Error(stderr);
+    }
+
     const metadata = JSON.parse(stdout);
 
     if (!metadata) {
@@ -105,29 +82,13 @@ app.get('/api/audio-info/:videoId', async (req, res) => {
       return currentSize > bestSize ? format : best;
     }, audioFormats[0] || {});
 
-    const videoFormats = metadata.formats.filter(f => f.vcodec !== 'none');
-    
-    const bestVideo = videoFormats.length > 0 
-      ? videoFormats.reduce((best, format) => {
-          const bestSize = best.filesize || best.filesize_approx || 0;
-          const currentSize = format.filesize || format.filesize_approx || 0;
-          return currentSize > bestSize ? format : best;
-        }, videoFormats[0])
-      : null;
-
-    const audioSize = bestAudio.filesize || bestAudio.filesize_approx || 0;
-    const videoSize = bestVideo?.filesize || bestVideo?.filesize_approx || audioSize * 3;
-    const estimatedAudioSize = Math.floor(audioSize * 0.75);
-
     res.json({
       videoId: videoId,
       title: metadata.title,
       duration: metadata.duration || 0,
-      videoSize: videoSize,
-      audioSize: estimatedAudioSize > 0 ? estimatedAudioSize : audioSize,
+      audioSize: (bestAudio.filesize || bestAudio.filesize_approx || 0),
       bitrate: bestAudio.abr || 128,
-      format: 'm4a',
-      quality: bestAudio.quality || 'medium'
+      format: 'm4a'
     });
 
     console.log(`✅ Info retrieved: ${metadata.title}`);
@@ -140,36 +101,58 @@ app.get('/api/audio-info/:videoId', async (req, res) => {
   }
 });
 
-// ИСПРАВЛЕНИЕ: Добавлена retry логика с браузерными заголовками
+// Скачивание с retry
 async function downloadWithRetry(videoUrl, tempPrefix, maxRetries = 3) {
   const cookiesPath = path.join(__dirname, 'cookies.txt');
-  const cookiesArg = fs.existsSync(cookiesPath) ? `--cookies ${cookiesPath}` : '';
   
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
       console.log(`🔄 Download attempt ${attempt}/${maxRetries}...`);
       
-      // ИСПРАВЛЕНИЕ: Добавлены браузерные заголовки
-      const downloadCommand = `${YT_DLP_PATH} ${cookiesArg} ${BROWSER_HEADERS.join(' ')} -f "bestaudio/best" -x --audio-format m4a --audio-quality 128K -o "${tempPrefix}.%(ext)s" --no-playlist --no-warnings --socket-timeout 30 "${videoUrl}"`;
+      const args = [
+        fs.existsSync(cookiesPath) ? '--cookies' : '--no-cookies',
+      ];
       
-      console.log(`🎵 Executing download with browser headers...`);
+      if (fs.existsSync(cookiesPath)) {
+        args.push(cookiesPath);
+      }
+
+      // ИСПРАВЛЕНИЕ: Все параметры как отдельные элементы массива
+      args.push(
+        '--user-agent',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        '--add-header',
+        'Accept-Language: ru-RU,ru;q=0.9,en-US;q=0.8',
+        '--add-header',
+        'Accept: */*',
+        '-f', 'bestaudio/best',
+        '-x',
+        '--audio-format', 'm4a',
+        '--audio-quality', '128K',
+        '-o', `${tempPrefix}.%(ext)s`,
+        '--no-playlist',
+        '--no-warnings',
+        '--socket-timeout', '30',
+        videoUrl
+      );
+
+      console.log(`🎵 Executing download...`);
+      const { success, stderr } = await executeYtDlp(args);
       
-      await execPromise(downloadCommand, { 
-        maxBuffer: 200 * 1024 * 1024,
-        timeout: 600000 // 10 минут
-      });
+      if (success) {
+        console.log(`✅ Download successful on attempt ${attempt}`);
+        return true;
+      }
       
-      console.log(`✅ Download successful on attempt ${attempt}`);
-      return true;
-      
-    } catch (error) {
-      console.error(`⚠️ Attempt ${attempt} failed: ${error.message}`);
+      console.error(`⚠️ Attempt ${attempt} failed: ${stderr}`);
       
       if (attempt < maxRetries) {
-        const delaySeconds = attempt * 5; // 5s, 10s, 15s
+        const delaySeconds = attempt * 5;
         console.log(`⏳ Waiting ${delaySeconds}s before retry...`);
         await new Promise(resolve => setTimeout(resolve, delaySeconds * 1000));
       }
+    } catch (error) {
+      console.error(`⚠️ Error on attempt ${attempt}: ${error.message}`);
     }
   }
   
@@ -192,10 +175,8 @@ app.get('/api/download-audio/:videoId', async (req, res) => {
     
     const tempPrefix = path.join(tempDir, `${videoId}_${Date.now()}`);
 
-    // ИСПРАВЛЕНИЕ: Используем retry функцию
     await downloadWithRetry(videoUrl, tempPrefix, 3);
 
-    // Находим созданный файл
     const files = fs.readdirSync(tempDir).filter(f => f.startsWith(path.basename(tempPrefix)));
     
     if (files.length === 0) {
@@ -203,8 +184,8 @@ app.get('/api/download-audio/:videoId', async (req, res) => {
     }
 
     tempFile = path.join(tempDir, files[0]);
-    
     const stats = fs.statSync(tempFile);
+    
     console.log(`✅ Downloaded: ${(stats.size / (1024 * 1024)).toFixed(2)} MB`);
 
     if (stats.size === 0) {
@@ -212,13 +193,11 @@ app.get('/api/download-audio/:videoId', async (req, res) => {
       throw new Error('Downloaded file is empty');
     }
 
-    // Отправляем файл клиенту
     res.setHeader('Content-Type', 'audio/mp4');
     res.setHeader('Content-Disposition', `attachment; filename="${videoId}.m4a"`);
     res.setHeader('Content-Length', stats.size);
 
     const fileStream = fs.createReadStream(tempFile);
-    
     fileStream.pipe(res);
 
     fileStream.on('end', () => {
@@ -252,14 +231,12 @@ app.get('/api/download-audio/:videoId', async (req, res) => {
     if (!res.headersSent) {
       res.status(500).json({
         error: 'Failed to download audio',
-        message: error.message,
-        details: error.toString()
+        message: error.message
       });
     }
   }
 });
 
-// Очистка старых временных файлов при старте
 function cleanupTempFiles() {
   const tempDir = path.join(__dirname, 'temp');
   if (fs.existsSync(tempDir)) {
@@ -273,21 +250,8 @@ function cleanupTempFiles() {
   }
 }
 
-checkYtDlp().then((success) => {
-  if (!success) {
-    console.error('❌ Cannot start server without yt-dlp');
-    process.exit(1);
-  }
-  
+app.listen(PORT, () => {
   cleanupTempFiles();
-  
-  app.listen(PORT, () => {
-    console.log(`🚀 AETHEL Backend running on port ${PORT}`);
-    console.log(`📍 http://localhost:${PORT}`);
-    console.log(`🎵 Ready to process audio downloads!`);
-    console.log(`📝 Using: Browser headers + retry logic`);
-  });
-}).catch(err => {
-  console.error('Failed to start server:', err);
-  process.exit(1);
+  console.log(`🚀 AETHEL Backend running on port ${PORT}`);
+  console.log(`✅ Using execFile (proper escaping)`);
 });
