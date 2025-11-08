@@ -188,7 +188,7 @@ app.get('/api/audio-info/:videoId', async (req, res) => {
 
     const audioSize = bestAudio.filesize || bestAudio.filesize_approx || 0;
     const videoSize = bestVideo?.filesize || bestVideo?.filesize_approx || audioSize * 3;
-    const estimatedAudioSize = Math.floor(audioSize * 0.75);
+    const estimatedAudioSize = Math.floor(audioSize);
 
     res.json({
       videoId: videoId,
@@ -406,3 +406,4 @@ checkYtDlp().then((success) => {
   console.error('Failed to start server:', err);
   process.exit(1);
 });
+
