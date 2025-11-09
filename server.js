@@ -20,6 +20,7 @@ class DownloadQueue {
     this.queue = [];
     this.processing = false;
     this.currentJob = null;
+    this.cancelledJobs = new Set();
   }
 
   add(job) {
@@ -28,11 +29,46 @@ class DownloadQueue {
     this.processNext();
   }
 
+  cancel(videoId) {
+    // Отмечаем как отмененный
+    this.cancelledJobs.add(videoId);
+    
+    // Удаляем из очереди
+    const initialLength = this.queue.length;
+    this.queue = this.queue.filter(job => job.videoId !== videoId);
+    const removed = initialLength - this.queue.length;
+    
+    if (removed > 0) {
+      console.log(`🛑 Removed ${videoId} from queue`);
+    }
+    
+    // Если это текущая задача - она завершится сама с проверкой
+    if (this.currentJob?.videoId === videoId) {
+      console.log(`🛑 Current job ${videoId} will be cancelled`);
+    }
+    
+    return removed > 0 || this.currentJob?.videoId === videoId;
+  }
+
+  isCancelled(videoId) {
+    return this.cancelledJobs.has(videoId);
+  }
+
   async processNext() {
     if (this.processing || this.queue.length === 0) return;
 
     this.processing = true;
     this.currentJob = this.queue.shift();
+    
+    // Проверяем, не отменена ли задача
+    if (this.isCancelled(this.currentJob.videoId)) {
+      console.log(`⏭️ Skipping cancelled job: ${this.currentJob.videoId}`);
+      this.cancelledJobs.delete(this.currentJob.videoId);
+      this.currentJob = null;
+      this.processing = false;
+      this.processNext();
+      return;
+    }
     
     console.log(`\n🔄 Processing: ${this.currentJob.videoId}`);
     console.log(`📊 Queue remaining: ${this.queue.length}`);
@@ -40,13 +76,15 @@ class DownloadQueue {
     try {
       await this.currentJob.execute();
       console.log(`✅ Completed: ${this.currentJob.videoId}`);
+      this.cancelledJobs.delete(this.currentJob.videoId);
     } catch (error) {
       console.error(`❌ Failed: ${this.currentJob.videoId}`, error.message);
       this.currentJob.reject(error);
+      this.cancelledJobs.delete(this.currentJob.videoId);
     } finally {
       this.currentJob = null;
       this.processing = false;
-      this.processNext(); // Обработать следующий
+      this.processNext();
     }
   }
 
@@ -100,7 +138,8 @@ app.get('/', (req, res) => {
     endpoints: [
       'GET /api/audio-info/:videoId',
       'GET /api/download-audio/:videoId',
-      'GET /api/queue-status'
+      'GET /api/queue-status',
+      'POST /api/cancel-download/:videoId'
     ]
   });
 });
@@ -108,6 +147,18 @@ app.get('/', (req, res) => {
 // === СТАТУС ОЧЕРЕДИ ===
 app.get('/api/queue-status', (req, res) => {
   res.json(downloadQueue.getStatus());
+});
+
+// === ОТМЕНА ЗАГРУЗКИ ===
+app.post('/api/cancel-download/:videoId', (req, res) => {
+  const { videoId } = req.params;
+  const cancelled = downloadQueue.cancel(videoId);
+  
+  res.json({
+    success: cancelled,
+    message: cancelled ? `Download cancelled: ${videoId}` : `Download not found: ${videoId}`,
+    queue: downloadQueue.getStatus()
+  });
 });
 
 async function executeYtDlp(args) {
@@ -188,7 +239,7 @@ app.get('/api/audio-info/:videoId', async (req, res) => {
 
     const audioSize = bestAudio.filesize || bestAudio.filesize_approx || 0;
     const videoSize = bestVideo?.filesize || bestVideo?.filesize_approx || audioSize * 3;
-    const estimatedAudioSize = Math.floor(audioSize);
+    const estimatedAudioSize = Math.floor(audioSize / 1.5);
 
     res.json({
       videoId: videoId,
@@ -288,6 +339,15 @@ app.get('/api/download-audio/:videoId', async (req, res) => {
         let tempFile = null;
 
         try {
+          // Проверка на отмену перед началом
+          if (downloadQueue.isCancelled(videoId)) {
+            console.log(`⏭️ Job cancelled before start: ${videoId}`);
+            if (!res.headersSent) {
+              res.status(499).json({ error: 'Download cancelled by user' });
+            }
+            return resolve();
+          }
+
           console.log(`📥 Starting download: ${videoId}`);
 
           const tempDir = path.join(__dirname, 'temp');
@@ -299,6 +359,23 @@ app.get('/api/download-audio/:videoId', async (req, res) => {
 
           // СКАЧИВАНИЕ + КОНВЕРТАЦИЯ (блокирующая операция)
           await downloadWithRetry(videoUrl, tempPrefix, 3);
+
+          // Проверка на отмену после скачивания
+          if (downloadQueue.isCancelled(videoId)) {
+            console.log(`⏭️ Job cancelled after download: ${videoId}`);
+            const files = fs.readdirSync(tempDir).filter(f => 
+              f.startsWith(path.basename(tempPrefix))
+            );
+            files.forEach(f => {
+              try {
+                fs.unlinkSync(path.join(tempDir, f));
+              } catch (e) {}
+            });
+            if (!res.headersSent) {
+              res.status(499).json({ error: 'Download cancelled by user' });
+            }
+            return resolve();
+          }
 
           const files = fs.readdirSync(tempDir).filter(f => 
             f.startsWith(path.basename(tempPrefix))
@@ -406,4 +483,3 @@ checkYtDlp().then((success) => {
   console.error('Failed to start server:', err);
   process.exit(1);
 });
-
